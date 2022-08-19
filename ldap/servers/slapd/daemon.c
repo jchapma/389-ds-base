@@ -959,6 +959,7 @@ slapd_daemon(daemon_ports_t *ports)
 #endif /* ENABLE_LDAPI */
 
     createsignalpipe();
+    create_op_threads_signalpipe();
     /* Setup our signal interception. */
     init_shutdown_detect();
 

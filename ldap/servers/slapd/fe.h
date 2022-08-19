@@ -68,6 +68,9 @@ void connection_cleanup(Connection *conn);
 void connection_reset(Connection *conn, int ns, PRNetAddr *from, int fromLen, int is_SSL);
 void connection_set_io_layer_cb(Connection *c, Conn_IO_Layer_cb push_cb, Conn_IO_Layer_cb pop_cb, void *cb_data);
 int connection_call_io_layer_callbacks(Connection *c);
+int create_op_threads_signalpipe(void);
+int set_signal_op_threads(void);
+int clear_signal_op_threads(void);
 
 /*
  * conntable.c
@@ -166,5 +169,4 @@ int sasl_map_init(void);
 int sasl_map_done(void);
 void sasl_map_read_lock(void);
 void sasl_map_read_unlock(void);
-
 #endif

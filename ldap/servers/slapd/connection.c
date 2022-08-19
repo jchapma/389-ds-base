@@ -11,6 +11,7 @@
 #include <config.h>
 #endif
 
+#include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/types.h>
@@ -18,9 +19,11 @@
 #include <sys/socket.h>
 #include <stdlib.h>
 #include <signal.h>
+#include <unistd.h>
 #include "slap.h"
 #include "prcvar.h"
 #include "prlog.h" /* for PR_ASSERT */
+#include <private/pprio.h> /* for PR_FileDesc2NativeHandle */
 #include "fe.h"
 #include <sasl/sasl.h>
 #if defined(LINUX)
@@ -37,6 +40,15 @@ static int is_ber_too_big(const Connection *conn, ber_len_t ber_len);
 static void log_ber_too_big_error(const Connection *conn,
                                   ber_len_t ber_len,
                                   ber_len_t maxbersize);
+/* lock free work queue */
+int create_op_threads_signalpipe(void);
+static int signal_op_threads(void);
+static int clear_op_threads_signal(void);
+static void init_work_queue(void);
+void destroy_work_queue(void);
+static int recycle_dequeued_nodes(void);
+
+#define SLAPD_OP_THREAD_POLL_TIMEOUT 250
 
 static PRStack *op_stack;     /* stack of Slapi_Operation * objects so we don't have to malloc/free every time */
 static PRInt32 op_stack_size; /* size of op_stack */
@@ -60,16 +72,19 @@ struct Slapi_work_q
     work_q_item *work_item;
     struct Slapi_op_stack *op_stack_obj;
     struct Slapi_work_q *next_work_item;
+    struct Slapi_work_q *next_deq_item; /* link to dequeued node */
 };
+
+
 
 static struct Slapi_work_q *head_work_q = NULL; /* global work queue head */
 static struct Slapi_work_q *tail_work_q = NULL; /* global work queue tail */
-static pthread_mutex_t work_q_lock;             /* protects head_conn_q and tail_conn_q */
-static pthread_cond_t work_q_cv;                /* used by operation threads to wait for work -
-                                                 * when there is a conn in the queue waiting
-                                                 * to be processed */
-static PRInt32 work_q_size;                     /* size of conn_q */
-static PRInt32 work_q_size_max;                 /* high water mark of work_q_size */
+static struct Slapi_work_q *head_deq_q = NULL;  /* global recycle queue head */
+
+static PRInt32 work_q_size;            /* size of conn_q */
+static PRInt32 work_q_size_max;        /* high water mark of work_q_size */
+static PRInt32 deq_q_size;             /* size of recycle queue section */
+static PRInt32 deq_q_size_max;         /* high water mark of recycle queue  section */
 #define WORK_Q_EMPTY (work_q_size == 0)
 static PRStack *work_q_stack;         /* stack of work_q structs so we don't have to malloc/free every time */
 static PRInt32 work_q_stack_size;     /* size of work_q_stack */
@@ -77,6 +92,8 @@ static PRInt32 work_q_stack_size_max; /* max size of work_q_stack */
 static PRInt32 op_shutdown = 0;       /* if non-zero, server is shutting down */
 
 #define LDAP_SOCKET_IO_BUFFER_SIZE 512 /* Size of the buffer we give to the I/O system for reads */
+
+static signal_pipe op_thread_pipe[1];  /* listener thread to worker thread signaling */
 
 static struct Slapi_work_q *
 create_work_q(void)
@@ -96,6 +113,8 @@ destroy_work_q(struct Slapi_work_q **work_q)
     if (work_q && *work_q) {
         (*work_q)->op_stack_obj = NULL;
         (*work_q)->work_item = NULL;
+        (*work_q)->next_work_item = NULL;
+        (*work_q)->next_deq_item = NULL;
         PR_StackPush(work_q_stack, (PRStackElem *)*work_q);
         PR_AtomicIncrement(&work_q_stack_size);
         if (work_q_stack_size > work_q_stack_size_max) {
@@ -428,41 +447,15 @@ connection_reset(Connection *conn, int ns, PRNetAddr *from, int fromLen __attrib
 void
 init_op_threads()
 {
-    pthread_condattr_t condAttr;
     int32_t max_threads = config_get_threadnumber();
-    int32_t rc;
     int32_t *threads_indexes;
 
-    /* Initialize the locks and cv */
-    if ((rc = pthread_mutex_init(&work_q_lock, NULL)) != 0) {
-        slapi_log_err(SLAPI_LOG_ERR, "init_op_threads",
-                      "Cannot create new lock.  error %d (%s)\n",
-                      rc, strerror(rc));
-        exit(-1);
-    }
-    if ((rc = pthread_condattr_init(&condAttr)) != 0) {
-        slapi_log_err(SLAPI_LOG_ERR, "init_op_threads",
-                      "Cannot create new condition attribute variable.  error %d (%s)\n",
-                      rc, strerror(rc));
-        exit(-1);
-    } else if ((rc = pthread_condattr_setclock(&condAttr, CLOCK_MONOTONIC)) != 0) {
-        slapi_log_err(SLAPI_LOG_ERR, "init_op_threads",
-                      "Cannot set condition attr clock.  error %d (%s)\n",
-                      rc, strerror(rc));
-        exit(-1);
-    } else if ((rc = pthread_cond_init(&work_q_cv, &condAttr)) != 0) {
-        slapi_log_err(SLAPI_LOG_ERR, "init_op_threads",
-                      "Cannot create new condition variable.  error %d (%s)\n",
-                      rc, strerror(rc));
-        exit(-1);
-    }
-    pthread_condattr_destroy(&condAttr); /* no longer needed */
 
     work_q_stack = PR_CreateStack("connection_work_q");
     op_stack = PR_CreateStack("connection_operation");
     alloc_per_thread_snmp_vars(max_threads);
     init_thread_private_snmp_vars();
-    
+    init_work_queue();
 
     threads_indexes = (int32_t *) slapi_ch_calloc(max_threads, sizeof(int32_t));
     for (size_t i = 0; i < max_threads; i++) {
@@ -978,40 +971,50 @@ connection_make_new_pb(Slapi_PBlock *pb, Connection *conn)
 }
 
 int
-connection_wait_for_new_work(Slapi_PBlock *pb, int32_t interval)
+connection_wait_for_new_work(Slapi_PBlock *pb)
 {
     int ret = CONN_FOUND_WORK_TO_DO;
     work_q_item *wqitem = NULL;
     struct Slapi_op_stack *op_stack_obj = NULL;
+    PRPollDesc fds;
+    PRIntervalTime timeout = PR_MillisecondsToInterval(SLAPD_OP_THREAD_POLL_TIMEOUT);
+    PRErrorCode prerr;
 
-    pthread_mutex_lock(&work_q_lock);
+    fds.fd = op_thread_pipe->signalpipe[0];
+    fds.in_flags = PR_POLL_READ;
+    fds.out_flags = 0;
+
 
     while (!op_shutdown && WORK_Q_EMPTY) {
-        if (interval == 0 ) {
-            pthread_cond_wait(&work_q_cv, &work_q_lock);
-        } else {
-            struct timespec current_time = {0};
-            clock_gettime(CLOCK_MONOTONIC, &current_time);
-            current_time.tv_sec += interval;
-            pthread_cond_timedwait(&work_q_cv, &work_q_lock, &current_time);
+        ret = PR_Poll(&fds, 1, timeout);
+        switch (ret) {
+            case 0: /* Timeout, do nothing */
+                break;
+            case -1: /* Error */
+                prerr = PR_GetError();
+                slapi_log_err(SLAPI_LOG_ERR, "connection_wait_for_new_work", "PR_Poll() failed, " SLAPI_COMPONENT_NAME_NSPR " error %d (%s)\n",
+                            prerr, slapd_system_strerror(prerr));
+                break;
+            default: /* activity detected on op_thread_pipe, clear the signal pipe*/
+                clear_op_threads_signal();
+                break;
         }
-    }
+   }
 
     if (op_shutdown) {
         slapi_log_err(SLAPI_LOG_TRACE, "connection_wait_for_new_work", "shutdown\n");
         ret = CONN_SHUTDOWN;
     } else if (NULL == (wqitem = get_work_q(&op_stack_obj))) {
-        /* not sure how this can happen */
-        slapi_log_err(SLAPI_LOG_TRACE, "connection_wait_for_new_work", "no work to do\n");
+        /* a worker thread has attempted a dequeue on an empty queue, ignore */
         ret = CONN_NOWORK;
     } else {
         /* make new pb */
         slapi_pblock_set(pb, SLAPI_CONNECTION, wqitem);
         slapi_pblock_set_op_stack_elem(pb, op_stack_obj);
         slapi_pblock_set(pb, SLAPI_OPERATION, op_stack_obj->op);
+        ret = CONN_FOUND_WORK_TO_DO;
     }
 
-    pthread_mutex_unlock(&work_q_lock);
     return ret;
 }
 
@@ -1500,7 +1503,6 @@ connection_threadmain(void *arg)
     Slapi_PBlock *pb = slapi_pblock_new();
     int32_t *snmp_vars_idx = (int32_t *) arg;
     /* wait forever for new pb until one is available or shutdown */
-    int32_t interval = 0; /* used be  10 seconds */
     Connection *conn = NULL;
     Operation *op;
     ber_tag_t tag = 0;
@@ -1537,11 +1539,10 @@ connection_threadmain(void *arg)
                we should finish the op now.  Client might be thinking it's
                done sending the request and wait for the response forever.
                [blackflag 624234] */
-            ret = connection_wait_for_new_work(pb, interval);
+            ret = connection_wait_for_new_work(pb);
 
             switch (ret) {
             case CONN_NOWORK:
-                PR_ASSERT(interval != 0); /* this should never happen */
                 continue;
             case CONN_SHUTDOWN:
                 slapi_log_err(SLAPI_LOG_TRACE, "connection_threadmain",
@@ -1950,13 +1951,14 @@ connection_activity(Connection *conn, int maxthreads)
     return 0;
 }
 
-/* add_work_q():  will add a work_q_item to the end of the global work queue. The work queue
-    is implemented as a single link list. */
-
+/* add_work_q():  will add a work_q_item to the tail end of the global work queue. The work queue
+    is implemented as a double linked list. */
 static void
 add_work_q(work_q_item *wqitem, struct Slapi_op_stack *op_stack_obj)
 {
     struct Slapi_work_q *new_work_q = NULL;
+    struct Slapi_work_q *tail_work = NULL;
+    struct Slapi_work_q *old_next = NULL;
 
     slapi_log_err(SLAPI_LOG_TRACE, "add_work_q", "=>\n");
 
@@ -1964,50 +1966,101 @@ add_work_q(work_q_item *wqitem, struct Slapi_op_stack *op_stack_obj)
     new_work_q->work_item = wqitem;
     new_work_q->op_stack_obj = op_stack_obj;
     new_work_q->next_work_item = NULL;
+    new_work_q->next_deq_item = NULL;
 
-    pthread_mutex_lock(&work_q_lock);
-    if (tail_work_q == NULL) {
-        tail_work_q = new_work_q;
-        head_work_q = new_work_q;
-    } else {
-        tail_work_q->next_work_item = new_work_q;
-        tail_work_q = new_work_q;
-    }
-    PR_AtomicIncrement(&work_q_size); /* increment q size */
+	while (1) {
+		tail_work = tail_work_q;
+        old_next = tail_work->next_work_item;
+        /* are our tail pointers consistent */
+        if (tail_work == tail_work_q) {
+            /* is tail pointing to the last node in the list */
+            if (old_next == NULL) {
+                if (__sync_bool_compare_and_swap(&tail_work->next_work_item, old_next, new_work_q)) {
+                    __sync_fetch_and_add(&work_q_size, 1);
+                    break;
+                }
+            } else {
+                /* this is not the last node, advance tail */
+                __sync_bool_compare_and_swap(&tail_work_q, tail_work, old_next);
+            }
+         }
+	}
+    /* swing tail to point to the latest node added */
+    __sync_bool_compare_and_swap(&tail_work_q, tail_work, new_work_q);
+
+    /* update high water mark of work_q_size*/
     if (work_q_size > work_q_size_max) {
         work_q_size_max = work_q_size;
     }
-    pthread_cond_signal(&work_q_cv); /* notify waiters in connection_wait_for_new_work */
-    pthread_mutex_unlock(&work_q_lock);
+
+    /* check the recycle queue for nodes that can be returned back to the work_q stack */
+    recycle_dequeued_nodes();
+
+    /* let the worker threads know a work item has been added */
+    signal_op_threads();
 }
 
-/* get_work_q(): will get a work_q_item from the beginning of the work queue, return NULL if
-    the queue is empty.  This should only be called from connection_wait_for_new_work
-    with the work_q_lock held */
+/* get_work_q(): will get a work_q_item from the head of the work queue, return NULL if
+   the queue is empty.  This should only be called from connection_wait_for_new_work
+   Dequeued nodes are added to the upper side of head for later recylcing. */
 
 static work_q_item *
 get_work_q(struct Slapi_op_stack **op_stack_obj)
 {
-    struct Slapi_work_q *tmp = NULL;
-    work_q_item *wqitem;
+    work_q_item *wqitem = NULL;
+    static struct Slapi_work_q *head_work = NULL;
+    static struct Slapi_work_q *tail_work = NULL;
+    static struct Slapi_work_q *head_next = NULL;
 
     slapi_log_err(SLAPI_LOG_TRACE, "get_work_q", "=>\n");
-    if (head_work_q == NULL) {
-        slapi_log_err(SLAPI_LOG_TRACE, "get_work_q", "The work queue is empty.\n");
-        return NULL;
-    }
 
-    tmp = head_work_q;
-    if (head_work_q == tail_work_q) {
-        tail_work_q = NULL;
-    }
-    head_work_q = tmp->next_work_item;
+    while(1) {
+        head_work = head_work_q;
+        tail_work = tail_work_q;
+        head_next = head_work->next_work_item;
 
-    wqitem = tmp->work_item;
-    *op_stack_obj = tmp->op_stack_obj;
-    PR_AtomicDecrement(&work_q_size); /* decrement q size */
-    /* Free the memory used by the item found. */
-    destroy_work_q(&tmp);
+         /* are our head pointers consistent */
+        if (head_work == head_work_q) {
+            /* do we have an empty queue or is tail lagging behind */
+            if (head_work == tail_work){
+                /* if we have an empty queue return NULL */
+                if (head_next == NULL) {
+                    return NULL;
+                }
+                /* tail is pointing to head in a non empty queue, advance tail */
+                __sync_bool_compare_and_swap(&tail_work_q, tail_work, head_next);
+            } else {
+                    /* grab the node to be dequeued */
+                    if (head_next) {
+                        wqitem = head_next->work_item;
+                        *op_stack_obj = head_next->op_stack_obj;
+                    }
+                    /* swing head to the next node and increment work queue size */
+                    if (__sync_bool_compare_and_swap(&head_work_q, head_work, head_next)) {
+                        __sync_fetch_and_sub(&work_q_size, 1);
+
+
+                            /* with a conventional queue we would recycle dequeued nodes here, in the lockless
+                               queue case we cannot, as another thread might be referencing it. Instead we link
+                               the dequeued node to the "left" of head each time a node is dequeued. This results
+                               in a double linked list.
+                            */
+                            if (__sync_bool_compare_and_swap(&head_work_q->next_deq_item, NULL, head_work)) {
+                                __sync_fetch_and_add(&deq_q_size, 1);
+
+                                /* update high water mark of deq_q_size*/
+                                if (deq_q_size > deq_q_size_max) {
+                                    deq_q_size_max = deq_q_size;
+                                }
+
+                                /* head_deq_q points to the first dequeued node*/
+                                __sync_bool_compare_and_swap(&head_deq_q->next_work_item, NULL, head_work);
+                            }
+                        break;
+                    }
+            }
+        }
+    }
 
     return (wqitem);
 }
@@ -2015,20 +2068,16 @@ get_work_q(struct Slapi_op_stack **op_stack_obj)
 /* Helper functions common to both varieties of connection code: */
 
 /* op_thread_cleanup() : This function is called by daemon thread when it gets
-    the slapd_shutdown signal.  It will set op_shutdown to 1 and notify
-    all thread waiting on op_thread_cv to terminate.  */
+    the slapd_shutdown signal, it will set op_shutdown. */
 
 void
 op_thread_cleanup()
 {
     slapi_log_err(SLAPI_LOG_INFO, "op_thread_cleanup",
-                  "slapd shutting down - signaling operation threads - op stack size %d max work q size %d max work q stack size %d\n",
-                  op_stack_size, work_q_size_max, work_q_stack_size_max);
+                  "slapd shutting down - signaling operation threads op stack size %d  max work q size %d  max work q stack size %d  max recycle q size %d\n",
+                  op_stack_size, work_q_size_max, work_q_stack_size_max, deq_q_size_max);
 
     PR_AtomicIncrement(&op_shutdown);
-    pthread_mutex_lock(&work_q_lock);
-    pthread_cond_broadcast(&work_q_cv); /* tell any thread waiting in connection_wait_for_new_work to shutdown */
-    pthread_mutex_unlock(&work_q_lock);
 }
 
 /* do this after all worker threads have terminated */
@@ -2039,6 +2088,9 @@ connection_post_shutdown_cleanup()
     int stack_cnt = 0;
     struct Slapi_work_q *work_q;
     int work_cnt = 0;
+
+    /* recycle any remaining nodes, including base nodes */
+    destroy_work_queue();
 
     while ((work_q = (struct Slapi_work_q *)PR_StackPop(work_q_stack))) {
         Connection *conn = (Connection *)work_q->work_item;
@@ -2418,4 +2470,135 @@ connection_has_psearch(Connection *c)
     }
 
     return 0;
+}
+
+/* signal pipe for listener thread to worker threads comms */
+int
+create_op_threads_signalpipe(void)
+{
+    if (PR_CreatePipe(&op_thread_pipe->signalpipe[0], &op_thread_pipe->signalpipe[1]) != 0) {
+        PRErrorCode prerr = PR_GetError();
+        slapi_log_err(SLAPI_LOG_ERR, "create_op_threads_signalpipe",
+                        "PR_CreatePipe() failed, %s error %d (%s)\n",
+                        SLAPI_COMPONENT_NAME_NSPR, prerr, slapd_pr_strerror(prerr));
+        return (-1);
+    }
+
+    op_thread_pipe->readsignalpipe = PR_FileDesc2NativeHandle(op_thread_pipe->signalpipe[0]);
+    op_thread_pipe->writesignalpipe = PR_FileDesc2NativeHandle(op_thread_pipe->signalpipe[1]);
+
+    if (fcntl(op_thread_pipe->readsignalpipe, F_SETFD, O_NONBLOCK) == -1) {
+        slapi_log_err(SLAPI_LOG_ERR, "create_op_threads_signalpipe",
+                        "Failed to set FD for read pipe (%d).\n", errno);
+    }
+
+    if (fcntl(op_thread_pipe->writesignalpipe, F_SETFD, O_NONBLOCK) == -1) {
+        slapi_log_err(SLAPI_LOG_ERR, "create_op_threads_signalpipe",
+                        "Failed to set FD for write pipe (%d).\n", errno);
+    }
+    return (0);
+}
+
+/* write to op thread signal pipe to indicate new items on work queue */
+static int
+signal_op_threads(void)
+{
+    if (write(op_thread_pipe->writesignalpipe, "", 1) != 1) {
+        slapi_log_err(SLAPI_LOG_CONNS,
+                    "signal_op_threads", "Could not write to op thread signal pipe\n");
+    }
+    return (0);
+}
+
+/* read from op thread signal pipe to clear, ignore empty pipe error (EAGAIN) */
+static int
+clear_op_threads_signal(void)
+{
+    char buf;
+    int ret = 0;
+
+    if ((ret = read(op_thread_pipe->readsignalpipe, &buf, 1)) != 1) {
+        if (errno != EAGAIN){
+            slapi_log_err(SLAPI_LOG_ERR, "clear_op_threads_signal", "read thread signal pipe error (%d).\n", errno);
+            ret = errno;
+        }
+    }
+    return ret;
+}
+
+/* create base nodes for work queue */
+static
+void init_work_queue(void)
+{
+    static struct Slapi_work_q *work_q_base = NULL;
+    static struct Slapi_work_q *recycle_q_base = NULL;
+
+    work_q_base = create_work_q();
+    work_q_base->next_work_item = NULL;
+    work_q_base->next_deq_item = NULL;
+
+    recycle_q_base = create_work_q();
+    recycle_q_base->next_work_item = NULL;
+    recycle_q_base->next_deq_item = NULL;
+
+    head_work_q = work_q_base;
+    tail_work_q = work_q_base;
+    head_deq_q = recycle_q_base;
+}
+
+/* return any remaining nodes to the work_q stack */
+void
+destroy_work_queue(void)
+{
+    static struct Slapi_work_q *head = NULL;
+    static struct Slapi_work_q *start_base_node = NULL;
+    static struct Slapi_work_q *end_base_node= NULL;
+    static struct Slapi_work_q *next = NULL;
+
+    start_base_node = head_deq_q;
+    end_base_node = tail_work_q;
+    head = head_deq_q;
+    while (head) {
+        next = head->next_work_item;
+        destroy_work_q(&head);
+        /* queue base nodes are not included in deq_q_size, so ignore */
+        if ((head != start_base_node) && (head != end_base_node)) {
+        __sync_fetch_and_sub(&deq_q_size, 1);
+        }
+        head = next;
+    }
+}
+
+/* iterate over the queue and return previously dequeued nodes back to the work_q stack */
+static
+int recycle_dequeued_nodes(void)
+{
+    static struct Slapi_work_q *head_deq = NULL;
+    static struct Slapi_work_q *head_next_deq = NULL;
+    static struct Slapi_work_q *head_next_next_deq = NULL;
+    static int deq_size = 0;
+
+    deq_size = deq_q_size;
+    /* head_work_q points to the last dequeued node so leave that alone in case another thread is using it */
+    while((deq_q_size > 3) && (head_deq_q->next_work_item != head_work_q)) {
+        head_deq = head_deq_q;
+        head_next_deq = head_deq->next_work_item;
+        head_next_next_deq = head_deq->next_work_item->next_work_item;
+
+        /* are our head pointers consistent */
+        if ((head_deq == head_deq_q)) {
+            /* empty queue, bail out */
+            if (head_next_deq == NULL) {
+                break;
+            }
+            /* advance head to head next */
+            if (__sync_bool_compare_and_swap(&head_deq->next_work_item, head_next_deq, head_next_next_deq)) {
+                __sync_fetch_and_sub(&deq_q_size, 1);
+                /* we are done with this node now, return it back to the work_q stack */
+                destroy_work_q(&head_next_deq);
+            }
+        }
+    }
+
+    return (deq_size - deq_q_size);
 }
